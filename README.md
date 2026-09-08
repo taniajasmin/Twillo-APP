@@ -1,18 +1,20 @@
 # Twilio Outbound Dialer
 
-A FastAPI-based automated outbound calling system for a system in Australia to contact pet owners about payment updates.  
-The system dials contacts from an uploaded CSV, plays a personalized greeting + pre-recorded message using ElevenLabs TTS, and transfers interested callers to a human agent.
+A FastAPI-based automated outbound calling system for a system in Australia to contact pet owners about failed payments.  
+The system dials contacts from an uploaded CSV, plays a personalized greeting + pre-recorded message using ElevenLabs TTS, records callers who ask for a payment link by SMS (press 1) into a dashboard work list for manual sending, and transfers callers who want to speak with the team (press 2) to a human agent.
 
 ## Features
 
 - Upload daily contact list via CSV (columns: `Client`, `Name`, `Phone`)
 - Sequential outbound calling with rate limiting (one call at a time)
-- Personalized "Hello [Name]" greeting generated via ElevenLabs TTS
-- Long common message played as pre-generated MP3
-- Speech & DTMF input detection ("transfer me" or press 1)
-- Transfer to human agent 
-- Call outcome tracking: `no_answer`, `answered_no_transfer`, `successfully_transferred`
-- Automatic CSV result generation with outcome column
+- Personalized "Hi [Name]" greeting generated via ElevenLabs TTS
+- Failed-payment script played as pre-generated MP3
+- Speech & DTMF input detection:
+  - Press 1 (or say "text me" / "SMS" / "send the link") → caller is added to the **SMS Requests panel** (nothing is sent automatically — the team texts the payment link manually)
+  - Press 2 (or say "transfer" / "agent" / "speak to someone") → transfer to human agent
+- SMS Requests panel on the dashboard (`sms_requests.json`, served by `/sms-requests`) listing Client, Name, Phone and request time; cleared on each new CSV upload
+- Call outcome tracking: `no_answer`, `busy`, `voicemail`, `sms_requested`, `completed_no_transfer`, `successfully_transferred`
+- Automatic CSV result generation with `Response` (outcome), `Selection` (which option they chose: "SMS payment link (1)" / "Speak with team (2)") and `Input` (how they chose it: "Pressed 1" / "Said: text me the link") columns
 - Simple HTML frontend for upload & start
 
 ## Tech Stack
@@ -111,7 +113,7 @@ vetpay-outbound-dialer/
 │   ├── please_hold.mp3
 │   ├── goodbye.mp3
 │   └── thank_you_goodbye.mp3
-└── output_results/     # Final CSVs with "Response" column
+└── output_results/     # Final CSVs with "Response", "Selection" and "Input" columns
 ```
 
 
@@ -119,9 +121,10 @@ vetpay-outbound-dialer/
 
 - Phone normalization: Handles BD (+880) and AU (+61) formats, strips spaces, etc.
 - Rate limiting: Calls are made sequentially with a queue to avoid Twilio rate limits.
-- Audio generation: Common message is generated once. Short "Hello [name]" is generated per contact if missing.
+- Audio generation: Common message is generated once per script version (`*_v4.mp3`). Short "Hi [name]" is generated per contact if missing. Changing `COMMON_MESSAGE_TEXT` requires bumping the audio version suffix (or deleting the cached MP3) so it regenerates.
+- SMS payment link: NOT sent automatically. Pressing 1 records the caller in `sms_requests.json` and confirms by voice that a link will be texted shortly — the team sends it manually from the dashboard list.
 - Twilio status callbacks: Only completed events are processed.
-- No duplicate transfers: If a call was already marked as transferred, status callback won't overwrite it.
+- No duplicate outcomes: Final outcomes (`successfully_transferred`, `sms_requested`) are never overwritten by later status callbacks. SMS requests are keyed by phone, so retried calls can't duplicate rows.
 - Future Improvements
 - Add real-time progress dashboard
 - Support retry for busy/no-answer calls

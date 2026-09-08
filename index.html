@@ -46,6 +46,7 @@
         .status-badge.successfully_transferred { background: rgba(76, 175, 80, 0.2); color: #81c784; }
         .status-badge.answered_no_transfer { background: rgba(255, 152, 0, 0.2); color: #ffb74d; }
         .status-badge.no_answer { background: rgba(244, 67, 54, 0.2); color: #e57373; }
+        .status-badge.sms_requested { background: rgba(33, 150, 243, 0.2); color: #64b5f6; }
         .load-btn { background: linear-gradient(135deg, #4CAF50, #388E3C); color: white; font-size: 18px; padding: 20px; }
         .settings-input { padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg-dark); color: white; width: 100%; }
 
@@ -126,6 +127,22 @@
             </div>
 
             <button class="load-btn" onclick="loadResults()">📊 LOAD CALL RESULTS NOW</button>
+
+            <div id="smsSection" style="margin-top: 30px; display: none;">
+                <div class="results-header">
+                    <h3>📱 SMS Payment Link Requests</h3>
+                    <button class="btn-primary" onclick="loadSmsRequests()" style="width: auto; padding: 10px 20px; margin: 0;">↻ Refresh</button>
+                </div>
+                <p style="color: var(--text-secondary); font-size: 13px; margin-bottom: 16px;">Callers who pressed 1 — send the payment link manually, then clear the list by uploading the next CSV.</p>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr><th>Client</th><th>Name</th><th>Phone</th><th>Requested At</th></tr>
+                        </thead>
+                        <tbody id="smsBody"></tbody>
+                    </table>
+                </div>
+            </div>
 
             <div id="resultsSection">
                 <div class="results-header">
@@ -263,7 +280,8 @@
     function startPolling() {
         if (pollingInterval) return;
         updateLiveStatus();
-        pollingInterval = setInterval(updateLiveStatus, 3000);
+        loadSmsRequests();
+        pollingInterval = setInterval(() => { updateLiveStatus(); loadSmsRequests(); }, 3000);
     }
     function stopPolling() { if(pollingInterval) { clearInterval(pollingInterval); pollingInterval = null; } }
 
@@ -327,23 +345,57 @@
         }
     }
 
+    async function loadSmsRequests() {
+        const res = await authorizedFetch(`${API_BASE}/sms-requests`);
+        if (!res || !res.ok) return;
+        const data = await res.json();
+        const requests = data.requests || [];
+        const tbody = document.getElementById('smsBody');
+        tbody.innerHTML = '';
+        if (requests.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; opacity:0.7;">No SMS requests yet</td></tr>';
+        } else {
+            requests.forEach(r => {
+                const row = document.createElement('tr');
+                [r.client, r.name, r.phone, r.timestamp].forEach(v => {
+                    const td = document.createElement('td');
+                    td.textContent = v || '';
+                    row.appendChild(td);
+                });
+                tbody.appendChild(row);
+            });
+        }
+        document.getElementById('smsSection').style.display = 'block';
+    }
+
     async function loadResults() {
         updateStatus("⏳", "Loading results...");
+        loadSmsRequests();
         const res = await authorizedFetch(`${API_BASE}/result-csv`);
         if (res && res.ok) {
             const csvText = await res.text();
             const lines = csvText.trim().split('\n');
             const headers = lines[0].split(',');
+            // Only show the 4 main columns; the CSV also has "Selection" and
+            // "Input" (e.g. "SMS payment link (1)" / "Pressed 1") which the
+            // dashboard doesn't need to display.
+            const visibleIdx = headers
+                .map((h, i) => ({ h: h.toLowerCase().trim(), i }))
+                .filter(o => ['client', 'name', 'phone', 'response'].includes(o.h))
+                .map(o => o.i);
             const tbody = document.getElementById('resultsBody');
             tbody.innerHTML = '';
             for (let i = 1; i < lines.length; i++) {
                 const values = lines[i].split(',');
                 const row = document.createElement('tr');
-                values.forEach((value, index) => {
+                visibleIdx.forEach(idx => {
+                    const value = (values[idx] || '').trim();
                     const td = document.createElement('td');
-                    if (headers[index].toLowerCase().trim() === 'response') {
-                        td.innerHTML = `<span class="status-badge ${value.trim()}">${value.trim().replace(/_/g, ' ')}</span>`;
-                    } else td.textContent = value;
+                    if (headers[idx].toLowerCase().trim() === 'response') {
+                        td.innerHTML = `<span class="status-badge ${value}">${value.replace(/_/g, ' ')}</span>`;
+                    } else {
+                        td.textContent = value;
+                    }
                     row.appendChild(td);
                 });
                 tbody.appendChild(row);
@@ -354,6 +406,7 @@
     }
     function downloadCSV() { window.open(`${API_BASE}/result-csv`, "_blank"); }
     window.onload = async () => {
+        loadSmsRequests(); // show pending SMS work list on dashboard open
         const res = await authorizedFetch(`${API_BASE}/live-status`);
         if (!res || !res.ok) return;
         const data = await res.json();

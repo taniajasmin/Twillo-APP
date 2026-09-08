@@ -8,6 +8,7 @@ from fastapi.responses import FileResponse
 import csv
 import json
 import os
+import re
 import time
 import fcntl
 from datetime import datetime
@@ -60,6 +61,7 @@ twilio = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 # ─── Paths ──────────────
 CONTACTS_CSV     = "contacts.csv"
 RESULTS_JSON     = "call_results.json"
+SMS_REQUESTS_JSON = "sms_requests.json"
 OUTPUT_CSV_DIR   = "output_results"
 AUDIO_DIR        = "audio"
 
@@ -134,7 +136,7 @@ def generate_audio(text: str, output_path: str):
         raise Exception("TTS generation failed")
 
 # ─── Pre-generate static / common audio files ─────────────────
-COMMON_MESSAGE_PATH = os.path.join(AUDIO_DIR, "common_message_v3.mp3")
+COMMON_MESSAGE_PATH = os.path.join(AUDIO_DIR, "common_message_v4.mp3")
 
 
 COMMON_TEXT = COMMON_MESSAGE_TEXT
@@ -149,8 +151,9 @@ else:
 
 # Other static phrases
 static_texts = {
-    "thank_you_goodbye_v3": "Thank you for your time. Goodbye.",
-    "please_hold_v3": "Please hold while I transfer you to a VetPay representative."
+    "thank_you_goodbye_v4": "Thank you for your time. Goodbye.",
+    "please_hold_v4": "Please hold while I transfer you to a VetPay representative.",
+    "sms_confirm_v5": "Thank you for your time. We will send you a detailed SMS on the process. Goodbye."
 }
 
 for key, txt in static_texts.items():
@@ -281,7 +284,7 @@ def load_contacts_to_memory():
     return count
 
 # Utils
-def save_result(phone: str, name: str, result: str):
+def save_result(phone: str, name: str, result: str, caller_input: str = ""):
     results = {}
     if os.path.exists(RESULTS_JSON):
         try:
@@ -290,14 +293,16 @@ def save_result(phone: str, name: str, result: str):
         except:
             pass
 
-    # DO NOT overwrite a transfer
-    if results.get(phone, {}).get("result") == "successfully_transferred":
+    # DO NOT overwrite a final in-call outcome (transfer or SMS requested)
+    FINAL_RESULTS = {"successfully_transferred", "sms_requested"}
+    if results.get(phone, {}).get("result") in FINAL_RESULTS:
         return
 
     results[phone] = {
         "name": name,
         "phone": phone,
         "result": result,
+        "input": caller_input,  # how they chose: "Pressed 1" / 'Said: "text me"'
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
 
@@ -321,18 +326,32 @@ def generate_final_output_csv():
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = os.path.join(OUTPUT_CSV_DIR, f"call_results_{ts}.csv")
 
+    # Plain-language label for the option the caller chose
+    SELECTION_LABELS = {
+        "sms_requested": "SMS payment link (1)",
+        "successfully_transferred": "Speak with team (2)",
+    }
+
     with open(CONTACTS_CSV, newline='', encoding='utf-8') as fin:
         reader = csv.DictReader(fin)
-        fieldnames = reader.fieldnames or ["Client", "Name", "Phone"]
-        if "Response" not in fieldnames:
-            fieldnames = fieldnames + ["Response"]
+        base_fields = reader.fieldnames or ["Client", "Name", "Phone"]
+        fieldnames = list(base_fields)
+        for col in ("Response", "Selection", "Input"):
+            if col not in fieldnames:
+                fieldnames = fieldnames + [col]
 
         rows = []
         for row in reader:
             ph = normalize_phone(row.get("Phone", ""))
-            resp = results.get(ph, {}).get("result", "")
-            new_row = row.copy()
+            entry = results.get(ph, {})
+            resp = entry.get("result", "")
+            # Rebuild from known columns only — drops the None restkey that
+            # csv.DictReader adds for ragged rows (extra unquoted commas),
+            # which would otherwise crash DictWriter.
+            new_row = {k: (row.get(k) or "") for k in base_fields}
             new_row["Response"] = resp
+            new_row["Selection"] = SELECTION_LABELS.get(resp, "")
+            new_row["Input"] = entry.get("input", "")
             rows.append(new_row)
 
     with open(out_path, "w", newline='', encoding='utf-8') as fout:
@@ -369,6 +388,8 @@ async def upload_contacts(file: UploadFile):
 
     if os.path.exists(RESULTS_JSON):
         os.remove(RESULTS_JSON)
+    if os.path.exists(SMS_REQUESTS_JSON):
+        os.remove(SMS_REQUESTS_JSON)
 
     count = load_contacts_to_memory()
 
@@ -452,10 +473,10 @@ def run_outbound_calls():
 
                 if phone and client:
                     # Generate hello audio per PHONE (not client)
-                    hello_path = os.path.join(AUDIO_DIR, f"hello_{phone}_v3.mp3")
+                    hello_path = os.path.join(AUDIO_DIR, f"hello_{phone}_v4.mp3")
 
                     if not os.path.exists(hello_path):
-                        hello_text = f"Hello {name},"
+                        hello_text = f"Hi {name},"
                         generate_audio(hello_text, hello_path)
 
                     call_queue.put((phone, name, client))
@@ -548,29 +569,59 @@ async def twilio_voice(request: Request):
         return Response(str(vr), media_type="application/xml")
 
     # ── Human or unknown: play the full call flow ──
-    # 1) Say name first
-    vr.play(f"{BASE_URL}/audio/hello_{phone}_v3.mp3")
-
-    # 2) Play full script (no gather here)
-    vr.play(f"{BASE_URL}/audio/common_message_v3.mp3")
-
-    # 3) NOW gather — Twilio will pass speech said earlier too
+    # IMPORTANT: audio must be INSIDE the <Gather>. Twilio does NOT buffer
+    # DTMF tones pressed during top-level <Play> verbs — if the caller presses
+    # 1/2 while the prompt is playing (the natural moment, right after hearing
+    # "...press 1..."), the digit is discarded because the Gather hasn't
+    # started yet. Nesting the <Play>s inside the Gather makes the digit
+    # capture active while the prompt is playing.
     gather = Gather(
         input="speech dtmf",
         speech_timeout="auto",
-        timeout=15,
+        timeout=20,
         num_digits=1,
-        action=f"/twilio/transfer?phone={phone}",
+        action=f"{BASE_URL}/twilio/transfer?phone={phone}",
         method="POST"
     )
+    # 1) Personalized greeting
+    gather.play(f"{BASE_URL}/audio/hello_{phone}_v4.mp3")
+    # 2) Full script (press-1 / press-2 prompt)
+    gather.play(f"{BASE_URL}/audio/common_message_v4.mp3")
 
     vr.append(gather)
 
-    # 4) If nothing was said at all
-    vr.play(f"{BASE_URL}/audio/thank_you_goodbye_v3.mp3")
+    # 3) If nothing was pressed at all
+    vr.play(f"{BASE_URL}/audio/thank_you_goodbye_v4.mp3")
 
     return Response(str(vr), media_type="application/xml")
 
+
+
+def save_sms_request(phone: str, name: str, client: str):
+    """Record that a caller asked for the payment link by SMS.
+
+    Nothing is sent automatically — the dashboard shows these requests in a
+    dedicated panel and the team sends the link manually later.
+    Keyed by phone so a retried call can't create duplicate rows.
+    """
+    requests_map = {}
+    if os.path.exists(SMS_REQUESTS_JSON):
+        try:
+            with open(SMS_REQUESTS_JSON, "r", encoding="utf-8") as f:
+                requests_map = json.load(f)
+        except Exception:
+            pass
+
+    requests_map[phone] = {
+        "name": name,
+        "phone": phone,
+        "client": client,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+
+    with open(SMS_REQUESTS_JSON, "w", encoding="utf-8") as f:
+        json.dump(requests_map, f, indent=2)
+    print(f"[SMS REQUEST] {name} ({phone}) asked for a payment link by SMS")
 
 
 @app.post("/twilio/transfer")
@@ -583,25 +634,62 @@ async def transfer_call(request: Request):
     digits = form.get("Digits")
     speech = (form.get("SpeechResult") or "").lower()
 
+    print(f"[TRANSFER] phone={phone} digits={digits!r} speech={speech!r}")
+
     contact = contact_map.get(phone)
     name = contact["name"] if contact else "customer"
 
-    wants_transfer = (
-        digits == "1" or
-        any(w in speech for w in [
-            "transfer", "agent", "human", "person", "yes",
-            "operator", "representative", "connect"
-        ])
+    # Word-level matching (not substring) so words like "money"/"context"
+    # don't accidentally trigger the "one"/"text" intents.
+    spoken_words = set(
+        w.strip(".,!?'\"") for w in speech.split()
     )
+
+    # Press 1 / say "text me" → send payment link by SMS
+    wants_sms = (
+        digits == "1" or
+        bool(spoken_words & {
+            "text", "texts", "sms", "message", "messages",
+            "link", "send", "one"
+        })
+    )
+
+    # Press 2 / say "transfer" → speak with a member of the team
+    wants_transfer = (
+        digits == "2" or
+        bool(spoken_words & {
+            "transfer", "agent", "human", "person", "speak", "talk",
+            "operator", "representative", "connect", "two"
+        })
+    )
+
+    # Human-readable record of HOW the caller responded, for the report.
+    # Punctuation (commas/quotes) is stripped so the CSV and the dashboard's
+    # simple parser stay safe.
+    if digits:
+        caller_input = f"Pressed {digits}"
+    elif speech:
+        cleaned = " ".join(re.sub(r"[^a-z0-9 ]", " ", speech).split())[:60]
+        caller_input = f"Said: {cleaned}" if cleaned else "No response"
+    else:
+        caller_input = "No response"
 
     vr = VoiceResponse()
 
-    if wants_transfer:
-        save_result(phone, name, "successfully_transferred")
-        vr.play(f"{BASE_URL}/audio/please_hold_v3.mp3") 
+    if wants_sms:
+        client = contact["client"] if contact else ""
+        save_sms_request(phone, name, client)
+        save_result(phone, name, "sms_requested", caller_input)
+        vr.play(f"{BASE_URL}/audio/sms_confirm_v5.mp3")
+    elif wants_transfer:
+        save_result(phone, name, "successfully_transferred", caller_input)
+        vr.play(f"{BASE_URL}/audio/please_hold_v4.mp3")
         vr.dial(HUMAN_AGENT_NUMBER)
     else:
-        vr.play(f"{BASE_URL}/audio/thank_you_goodbye_v3.mp3") 
+        # Neither option chosen (e.g. pressed 3 or said something unrelated) —
+        # record what they did so the report shows it.
+        save_result(phone, name, "completed_no_transfer", caller_input)
+        vr.play(f"{BASE_URL}/audio/thank_you_goodbye_v4.mp3")
 
     return Response(str(vr), media_type="application/xml")
 
@@ -747,6 +835,27 @@ def live_status():
         "current": s["current"],
         "log": call_log[:30]
     }
+
+
+@app.get("/sms-requests")
+def sms_requests():
+    """Callers who pressed 1 / asked for the payment link by SMS.
+
+    The team sends the link manually — this is the work list.
+    """
+    data = {}
+    if os.path.exists(SMS_REQUESTS_JSON):
+        try:
+            with open(SMS_REQUESTS_JSON, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    requests_list = sorted(
+        data.values(),
+        key=lambda r: r.get("timestamp", ""),
+        reverse=True
+    )
+    return {"requests": requests_list}
 
 
 
